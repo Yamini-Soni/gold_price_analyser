@@ -519,13 +519,13 @@ def display_price_comparison(real_time_prices, show_inr_conversion=False):
 
 def main():
     st.set_page_config(
-        page_title="🥇 Advanced Gold Price Predictor",
+        page_title="Gold Price Predictor",
         page_icon="🥇",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    st.title("🥇 Advanced Gold Price Prediction Dashboard")
+    st.title("🥇 Gold Price Prediction Dashboard")
     st.markdown("**Real-time gold prices and AI-powered predictions for India 🇮🇳, USA 🇺🇸, and Dubai 🇦🇪**")
     
     # Sidebar configuration
