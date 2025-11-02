@@ -13,7 +13,13 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import warnings
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 warnings.filterwarnings('ignore')
+from transformers import pipeline
+
+# Load the Hugging Face sentiment analysis pipeline once
+sentiment_model = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+
 
 # Load environment variables
 load_dotenv()
@@ -27,7 +33,7 @@ EXCHANGE_API_KEY = os.getenv('EXCHANGE_API_KEY')  # Free tier: exchangerate-api.
 
 # Initialize Groq client
 try:
-    groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    groq_client = Groq(api_key=["GROQ_API_KEY"]) 
 except:
     groq_client = None
 
@@ -43,7 +49,7 @@ COUNTRY_CONFIG = {
     'India': {
         'currency': 'INR', 
         'symbol': 'GC=F',
-        'multiplier': 86.93,  # USD to INR
+        'multiplier': 88.79,  # USD to INR
         'unit': '10g',
         'flag': '🇮🇳'
     },
@@ -88,9 +94,10 @@ class GoldPricePredictor:
         df['day_of_week'] = pd.to_datetime(df['date']).dt.dayofweek
         
         # Fill remaining NaNs with 0 and replace infinite values
-        df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        df = df.replace([np.inf, -np.inf], np.nan).fillna(df['volatility'].mean())
         
         return df
+        
     
     def calculate_rsi(self, prices, window=14):
         """Calculate RSI indicator with proper NaN handling"""
@@ -117,11 +124,11 @@ class GoldPricePredictor:
                           'volume_change', 'hour', 'day_of_week']
             
             # Prepare training data
-            X = df_features[feature_cols].iloc[:-1].fillna(0)
-            y = df_features['close'].iloc[1:].values  # Predict next close price
+            X = df_features[feature_cols].iloc[:-1]
+            y = df_features['close'].iloc[1:].values  # Predict next close price and convert pandas sequence to numpy arrays
             
             # Remove any remaining infinite values
-            X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
+            X = X.replace([np.inf, -np.inf], np.nan).fillna(X.mean())
             
             if len(X) > 10:  # Minimum data requirement
                 X_scaled = self.scaler.fit_transform(X)
@@ -129,10 +136,44 @@ class GoldPricePredictor:
                 self.is_trained = True
                 return True
             return False
+
+            
+            
+
         except Exception as e:
             st.error(f"Training error: {e}")
             return False
     
+    def evaluate(self, df):
+        """Evaluate model accuracy (error metrics)"""
+        if not self.is_trained:
+            st.warning("Model not trained yet!")
+            return None
+
+        df_features = self.prepare_features(df)
+        feature_cols = ['sma_5', 'sma_20', 'rsi', 'volatility',
+                        'price_change', 'volume_change', 'hour', 'day_of_week']
+
+        X = df_features[feature_cols].iloc[:-1].fillna(0)
+        y_true = df_features['close'].iloc[1:].values
+
+        X_scaled = self.scaler.transform(X)
+        y_pred = self.model.predict(X_scaled)
+
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_true, y_pred)
+
+        print(f"📊 Model Evaluation:")
+        print(f"MAE  : {mae:.2f}")
+        print(f"MSE  : {mse:.2f}")
+        print(f"RMSE : {rmse:.2f}")
+        print(f"R²   : {r2:.3f}")
+
+        return mae, mse, rmse, r2
+
+
     def predict_next_prices(self, df, steps=10):
         """Predict next price movements with proper error handling"""
         if not self.is_trained:
@@ -187,12 +228,12 @@ def get_exchange_rates():
         data = response.json()
         
         return {
-            'USD_INR': data['rates'].get('INR', 86.93),
-            'USD_AED': data['rates'].get('AED', 3.67)
+            'USD_INR': data['rates']['INR'],
+            'USD_AED': data['rates']['AED']
         }
     except:
         # Fallback rates
-        return {'USD_INR': 86.93, 'USD_AED': 3.67}
+        return {'USD_INR': 88.79, 'USD_AED': 3.67}
 
 def get_multi_country_gold_data(days=30):
     """Fetch gold data for multiple countries using yfinance (FREE)"""
@@ -303,7 +344,7 @@ def get_real_time_multi_country_prices():
         st.error(f"Error fetching real-time prices: {e}")
         return None
 
-def get_news_data(days=7):
+def get_news_data(days=20):
     """Fetch gold-related news from News API"""
     try:
         end_date = datetime.now()
@@ -341,181 +382,113 @@ def get_news_data(days=7):
         return []
 
 def analyze_sentiment(text):
-    """Analyze sentiment using TextBlob"""
+    """Analyze sentiment using Hugging Face DistilBERT"""
     try:
-        blob = TextBlob(text)
-        polarity = blob.sentiment.polarity
-        
-        if polarity > 0.1:
-            return 'Positive', polarity
-        elif polarity < -0.1:
-            return 'Negative', polarity
-        else:
-            return 'Neutral', polarity
-    except:
+        # Truncate long text (BERT limit ~512 tokens)
+        text = text[:512]
+
+        # Run sentiment prediction
+        result = sentiment_model(text)[0]  
+        # Example: {'label': 'POSITIVE', 'score': 0.998}
+
+        label = result['label'].capitalize()  # 'Positive' or 'Negative'
+        polarity = round(result['score'], 3)  # Confidence score (0–1)
+
+        return label, polarity
+
+    except Exception as e:
         return 'Neutral', 0.0
 
-def get_groq_analysis(gold_data, news_sentiment, real_time_price=None):
-    """Get AI analysis from Groq"""
-    if not groq_client:
-        return "Groq API not available. Please check your API key."
-    
-    try:
-        # Prepare data for Groq
-        if isinstance(gold_data, dict):
-            # Multi-country data
-            analysis_text = "Multi-country gold price analysis:\n"
-            for country, df in gold_data.items():
-                latest_price = df['close'].iloc[-1]
-                price_change = ((latest_price - df['close'].iloc[0]) / df['close'].iloc[0] * 100) if len(df) > 1 else 0
-                analysis_text += f"- {country}: {latest_price:.2f} {df['currency'].iloc[0]} ({price_change:+.2f}%)\n"
-        else:
-            # Single dataset
-            latest_price = real_time_price if real_time_price else gold_data['close'].iloc[-1] if not gold_data.empty else 0
-            price_change = ((latest_price - gold_data['close'].iloc[0]) / gold_data['close'].iloc[0] * 100) if len(gold_data) > 1 else 0
-            analysis_text = f"Gold Price: {latest_price:.2f} ({price_change:+.2f}%)"
-        
-        avg_sentiment = sum([s[1] for s in news_sentiment]) / len(news_sentiment) if news_sentiment else 0
-        positive_count = len([s for s in news_sentiment if s[0] == 'Positive'])
-        negative_count = len([s for s in news_sentiment if s[0] == 'Negative'])
-        
-        prompt = f"""
-        Analyze the gold market based on the following data:
-        
-        {analysis_text}
-        
-        News Sentiment Analysis:
-        - Average Sentiment Score: {avg_sentiment:.3f} (range: -1 to 1)
-        - Positive News Articles: {positive_count}
-        - Negative News Articles: {negative_count}
-        - Total Articles Analyzed: {len(news_sentiment)}
-        
-        Please provide:
-        1. Brief market outlook for gold prices
-        2. Key factors from news sentiment
-        3. Investment recommendation with reasoning
-        
-        Keep response concise and professional.
-        """
-        
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama3-8b-8192",
-            temperature=0.3,
-            max_tokens=400
-        )
-        
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"Error getting Groq analysis: {e}"
 
-def natural_language_query_handler(query, country_data, predictions):
-    """Handle natural language queries about gold prices"""
-    query = query.lower()
-    
-    if not groq_client:
-        return "Natural language processing is not available. Please check your Groq API key."
-    
-    try:
-        # Extract current prices
-        current_prices = []
-        for country, data in country_data.items():
-            latest_price = data['close'].iloc[-1]
-            current_prices.append(f"{country}: {latest_price:.2f} {data['currency'].iloc[0]}")
-        
-        # Create context for AI
-        context = f"""
-        Current Gold Prices:
-        {chr(10).join(current_prices)}
-        
-        Recent price predictions are available for short-term forecasting.
-        
-        User Query: {query}
-        
-        Please provide a helpful response about gold prices, predictions, or market analysis.
-        """
-        
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": context}],
-            model="llama3-8b-8192",
-            temperature=0.3,
-            max_tokens=300
-        )
-        
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        return f"Error processing query: {e}"
 
-def display_price_comparison(real_time_prices, show_inr_conversion=False):
-    """Display price comparison between countries"""
+def display_price_comparison(real_time_prices, show_inr_conversion=True):
+    """Display global gold price comparison with INR conversion and reason for price differences."""
+
     if not real_time_prices:
+        st.warning("No real-time gold price data available.")
         return
-    
+
     st.subheader("🌍 Global Gold Price Comparison")
-    
-    # Convert all prices to USD for comparison
+
     rates = get_exchange_rates()
     usd_prices = {}
-    
+    inr_prices = {}
+
+    # Convert all prices to USD and INR for fair comparison
     for country, data in real_time_prices.items():
+        price = data['price']
+        currency = data['currency']
+
         if country == 'India':
-            usd_price = data['price'] / rates['USD_INR'] * 28.3495 / 10
+            # ₹/10g → USD/oz
+            #usd_price = (price / rates['USD_INR']) * (31.1035 / 10)
+            inr_price = price*31.1035 /10 # Already in INR
         elif country == 'Dubai':
-            usd_price = data['price'] / rates['USD_AED']
+            # AED/oz → USD/oz → INR/oz
+            usd_price = price / rates['USD_AED']
+            inr_price = (usd_price * rates['USD_INR'])
+        elif country == 'USA':
+            # USD/oz → INR/oz
+            usd_price = price
+            inr_price = price * rates['USD_INR']
         else:
-            usd_price = data['price']
+            usd_price = price
+            inr_price = price * rates['USD_INR']
+
         usd_prices[country] = usd_price
-    
+        inr_prices[country] = inr_price
+
     # Find cheapest and most expensive
-    cheapest = min(usd_prices, key=usd_prices.get)
-    most_expensive = max(usd_prices, key=usd_prices.get)
-    
-    col1, col2, col3 = st.columns(3)
-    
+    cheapest = min(inr_prices, key=inr_prices.get)
+    most_expensive = max(inr_prices, key=inr_prices.get)
+
+    # Display in three columns
+    cols = st.columns(min(3, len(real_time_prices)))
+
     for i, (country, data) in enumerate(real_time_prices.items()):
-        with [col1, col2, col3][i]:
-            delta_color = "normal"
+        with cols[i % 3]:
             delta_text = ""
-            
+            delta_color = "normal"
+
             if country == cheapest:
                 delta_text = "🏆 Cheapest"
                 delta_color = "inverse"
             elif country == most_expensive:
                 delta_text = "💎 Most Expensive"
-                delta_color = "normal"
-            
-            # Main price display
+
+            # Display main price metric
             st.metric(
                 f"{data['flag']} {country}",
                 f"{data['price']:.2f} {data['currency']}/{data['unit']}",
                 delta_text,
                 delta_color=delta_color
             )
-            
-            # Show INR conversion if requested
-            if show_inr_conversion and country != 'India':
-                if country == 'USA':
-                    inr_price = data['price'] * rates['USD_INR']
-                    st.caption(f"≈ ₹{inr_price:.2f} INR/oz")
-                elif country == 'Dubai':
-                    inr_price = (data['price'] / rates['USD_AED']) * rates['USD_INR']
-                    st.caption(f"≈ ₹{inr_price:.2f} INR/oz")
-    
-    # Additional conversion helper
-    if show_inr_conversion:
-        st.subheader("💱 Currency Conversion Helper")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.info(f"**Exchange Rates:**\n- 1 USD = ₹{rates['USD_INR']:.2f}\n- 1 AED = ₹{rates['USD_INR']/rates['USD_AED']:.2f}")
-        
-        with col2:
-            usa_in_inr = real_time_prices['USA']['price'] * rates['USD_INR']
-            st.info(f"**USA Gold in INR:**\n₹{usa_in_inr:.2f} per oz\n₹{usa_in_inr/31.1035*10:.2f} per 10g")
-        
-        with col3:
-            dubai_in_inr = (real_time_prices['Dubai']['price'] / rates['USD_AED']) * rates['USD_INR']
-            st.info(f"**Dubai Gold in INR:**\n₹{dubai_in_inr:.2f} per oz\n₹{dubai_in_inr/31.1035*10:.2f} per 10g")
+
+            # Always show equivalent INR values
+            st.caption(f"≈ ₹{inr_prices[country]:,.2f} per oz")
+
+            # Also show conversion to 10g for consistency
+            st.caption(f"≈ ₹{inr_prices[country] / 31.1035 * 10:,.2f} per 10g")
+
+    # 📘 Explanation of differences
+    st.subheader("📊 Why Do Gold Prices Differ Between Countries?")
+
+    st.markdown("""
+    Even though gold is a global commodity, its retail price varies by country because of these key factors:
+    - **🔸 Import Duty:** India imposes ~15% import tax on gold imports, while Dubai and USA have very low or zero duties.
+    - **🔸 GST / VAT:** India adds 3% GST on top of gold prices, while Dubai has 5% VAT but often waives it for tourists.
+    - **🔸 Currency Exchange Rate:** Fluctuations in USD/INR and USD/AED affect local pricing.
+    - **🔸 Making Charges:** In India, jewellers add making charges (up to 8–15%) for ornaments.
+    - **🔸 Market Demand & Premiums:** Local festivals, investment demand, and central bank policies can raise or lower local prices.
+    """)
+
+    # Comparison summary
+    st.info(f"""
+    💡 **Summary Insight:**
+    - Cheapest Market: **{cheapest}**
+    - Most Expensive Market: **{most_expensive}**
+    - Difference: ₹{(usd_prices[most_expensive] - usd_prices[cheapest]):,.2f} per oz
+    """)
 
 def main():
     st.set_page_config(
@@ -534,7 +507,7 @@ def main():
     # API Status Check
     st.sidebar.subheader("📡 API Status")
     api_status = {
-        "Groq (AI Analysis)": "✅" if GROQ_API_KEY else "❌",
+       
         "News API": "✅" if NEWS_API_KEY else "❌", 
         "Exchange Rates": "✅" if EXCHANGE_API_KEY else "⚠️ (Limited)",
         "Yahoo Finance": "✅ (Free)"
@@ -556,14 +529,10 @@ def main():
     )
     
     # Natural Language Query Interface
-    st.sidebar.subheader("💬 Ask About Gold Prices")
-    user_query = st.sidebar.text_input(
-        "Ask anything:",
-        placeholder="What will gold price be next week in India?"
-    )
+    
     
     # Main dashboard
-    tab1, tab2, tab3, tab4 = st.tabs(["🏠 Dashboard", "📈 Predictions", "📰 News & Analysis", "🤖 AI Chat"])
+    tab1, tab2, tab3 = st.tabs(["🏠 Dashboard", "📈 Predictions", "📰 News & Analysis"])
     
     with tab1:
         if st.button("🔄 Get Live Gold Prices", type="primary"):
@@ -591,26 +560,47 @@ def main():
                 
                 if country_data:
                     # Create combined chart
-                    fig = go.Figure()
-                    
                     for country, df in country_data.items():
+                        fig = go.Figure()
                         fig.add_trace(go.Scatter(
                             x=df['date'],
                             y=df['close'],
-                            mode='lines',
-                            name=f"{COUNTRY_CONFIG[country]['flag']} {country} ({df['currency'].iloc[0]})",
+                            mode='lines+markers',
+                            name=f"{country} ({df['currency'].iloc[0]})",
                             line=dict(width=2)
                         ))
+                        fig.update_layout(
+                            title=f"{country} Gold Price History",
+                            xaxis_title="Date",
+                            yaxis_title=f"Price ({df['currency'].iloc[0]})",
+                            height=400
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
                     
-                    fig.update_layout(
-                        title="Gold Price Trends - Multi-Country Comparison",
+                    # --- Combined Graph: % Change Comparison ---
+                    st.subheader("📈 Daily % Change Comparison Across Countries")
+                    
+                    fig_change = go.Figure()
+                    
+                    for country, df in country_data.items():
+                        df['pct_change'] = df['close'].pct_change() * 100  # daily percentage change
+                        fig_change.add_trace(go.Scatter(
+                            x=df['date'],
+                            y=df['pct_change'],
+                            mode='lines',
+                            name=f"{country}",
+                            line=dict(width=9)
+                        ))
+                    
+                    fig_change.update_layout(
+                        title="Relative Gold Price Movements (Daily % Change)",
                         xaxis_title="Date",
-                        yaxis_title="Price (Local Currency)",
+                        yaxis_title="Daily % Change",
                         height=500,
                         hovermode='x unified'
                     )
                     
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig_change, use_container_width=True)
     
     with tab2:
         st.subheader("🔮 AI-Powered Price Predictions")
@@ -626,36 +616,43 @@ def main():
                         predictor = GoldPricePredictor()
                         
                         if predictor.train(df):
+                            predictor.evaluate(df)
                             predictions = predictor.predict_next_prices(df, prediction_steps)
                             if predictions:
                                 predictions_data[country] = predictions
                     
                     if predictions_data:
                         # Display predictions
+                        
                         st.subheader("📈 Short-term Predictions (Next 10 Steps)")
-                        
                         fig_pred = go.Figure()
-                        
                         for country, predictions in predictions_data.items():
-                            # Create time steps
-                            time_steps = list(range(len(predictions)))
+                            current_price = country_data[country]['close'].iloc[-1]
                             
+                            # Convert predictions into percentage change from current price
+                            pct_change = [(p - current_price) / current_price * 100 for p in predictions]
+                            time_steps = list(range(1, len(predictions) + 1))
+
                             fig_pred.add_trace(go.Scatter(
                                 x=time_steps,
-                                y=predictions,
+                                y=pct_change,  # 👈 percent change instead of raw price
                                 mode='lines+markers',
-                                name=f"{COUNTRY_CONFIG[country]['flag']} {country}",
-                                line=dict(width=3)
+                                line=dict(width=3),
+                                marker=dict(size=7),
+                                name=f"{COUNTRY_CONFIG[country]['flag']} {country}"
                             ))
-                        
+
                         fig_pred.update_layout(
-                            title="Gold Price Predictions - Next Steps",
-                            xaxis_title="Time Steps (Minutes/Seconds)",
-                            yaxis_title="Predicted Price",
-                            height=400
+                            title="Gold Price Predictions (% Change Comparison)",
+                            xaxis_title="Prediction Steps (Next Day/Intervals)",
+                            yaxis_title="Predicted % Change from Current Price",
+                            height=450,
+                            hovermode='x unified',
+                            template='plotly_white'
                         )
-                        
+
                         st.plotly_chart(fig_pred, use_container_width=True)
+                        
                         
                         # Prediction summary
                         st.subheader("📋 Prediction Summary")
@@ -675,29 +672,37 @@ def main():
                             with col3:
                                 trend = "📈 Bullish" if change > 0 else "📉 Bearish" if change < 0 else "➡️ Neutral"
                                 st.metric("Trend", trend)
-    
+    sentiment_analyzer = pipeline("sentiment-analysis")
     with tab3:
         st.subheader("📰 News Sentiment & Market Analysis")
         
         if st.button("📊 Analyze Market Sentiment", type="primary"):
             with st.spinner("Analyzing news and market sentiment..."):
                 
-                # Get news data
-                news_articles = get_news_data(7)
+                # 🗞️ Step 1: Fetch gold-related news for the last 7 days
+                news_articles = get_news_data(21)
                 
                 if news_articles:
-                    # Analyze sentiment
+                    # 🧠 Step 2: Analyze sentiment using Hugging Face
                     news_with_sentiment = []
                     for article in news_articles:
                         text = f"{article['title']} {article['description']}"
-                        sentiment, score = analyze_sentiment(text)
+                        
+                        try:
+                            # Hugging Face model returns: [{'label': 'POSITIVE', 'score': 0.98}]
+                            result = sentiment_analyzer(text[:512])[0]  # truncate long texts
+                            label = result['label'].capitalize()
+                            score = result['score'] if label == 'Positive' else -result['score']
+                        except Exception:
+                            label, score = 'Neutral', 0.0
+                        
                         news_with_sentiment.append({
                             **article,
-                            'sentiment': sentiment,
+                            'sentiment': label,
                             'sentiment_score': score
                         })
                     
-                    # Display sentiment analysis
+                    # 📊 Step 3: Sentiment distribution pie chart
                     sentiment_counts = pd.DataFrame(news_with_sentiment)['sentiment'].value_counts()
                     
                     col1, col2 = st.columns(2)
@@ -706,73 +711,41 @@ def main():
                         fig_pie = px.pie(
                             values=sentiment_counts.values,
                             names=sentiment_counts.index,
-                            title="Market Sentiment Distribution"
+                            title="Market Sentiment Distribution",
+                            color_discrete_sequence=["#16a34a", "#dc2626", "#facc15"]  # Green, Red, Yellow
                         )
                         st.plotly_chart(fig_pie, use_container_width=True)
                     
+                    # 📈 Step 4: Average sentiment score & summary
                     with col2:
                         avg_sentiment = np.mean([a['sentiment_score'] for a in news_with_sentiment])
                         st.metric("Average Sentiment", f"{avg_sentiment:.3f}")
                         
-                        if avg_sentiment > 0.1:
+                        if avg_sentiment > 0.3:
                             st.success("📈 Positive market sentiment")
-                        elif avg_sentiment < -0.1:
+                        elif avg_sentiment < -0.3:
                             st.error("📉 Negative market sentiment")
                         else:
                             st.info("➡️ Neutral market sentiment")
                 
-                    # Display recent news articles
+                    # 📰 Step 5: Display recent news articles with sentiment
                     st.subheader("📰 Recent Gold Market News")
-                    for i, article in enumerate(news_with_sentiment[:5]):
-                        sentiment_color = {
-                            'Positive': '🟢',
-                            'Negative': '🔴', 
-                            'Neutral': '🟡'
-                        }
-                        
-                        with st.expander(f"{sentiment_color[article['sentiment']]} {article['title'][:80]}..."):
+                    sentiment_color = {
+                        'Positive': '🟢',
+                        'Negative': '🔴', 
+                        'Neutral': '🟡'
+                    }
+                    
+                    for i, article in enumerate(news_with_sentiment[:50]):
+                        emoji = sentiment_color.get(article['sentiment'], '⚪')
+                        with st.expander(f"{emoji} {article['title'][:80]}..."):
                             st.write(f"**Source:** {article['source']}")
                             st.write(f"**Published:** {article['publishedAt']}")
                             st.write(f"**Sentiment:** {article['sentiment']} ({article['sentiment_score']:.3f})")
                             st.write(f"**Description:** {article['description']}")
                             st.write(f"**[Read More]({article['url']})**")
                     
-                    # Get AI analysis of sentiment
-                    if groq_client:
-                        st.subheader("🤖 AI Market Analysis")
-                        with st.spinner("Getting AI insights..."):
-                            country_data_for_analysis = get_multi_country_gold_data(7)
-                            ai_analysis = get_groq_analysis(country_data_for_analysis or {}, news_with_sentiment)
-                            st.markdown(ai_analysis)
-    
-    with tab4:
-        st.subheader("🤖 AI Assistant - Ask Anything About Gold Prices")
-        
-        if user_query:
-            with st.spinner("AI is analyzing your query..."):
-                country_data = get_multi_country_gold_data(days_data)
-                response = natural_language_query_handler(user_query, country_data or {}, {})
-                st.write("**AI Response:**")
-                st.write(response)
-        
-        # Pre-defined quick questions
-        st.subheader("💡 Quick Questions")
-        quick_questions = [
-            "What will gold price be next week?",
-            "Which country has the cheapest gold right now?",
-            "Why is gold price different in India and USA?",
-            "Should I buy gold now or wait?",
-            "What factors affect gold prices?"
-        ]
-        
-        for question in quick_questions:
-            if st.button(question):
-                with st.spinner("Processing..."):
-                    country_data = get_multi_country_gold_data(days_data)
-                    response = natural_language_query_handler(question, country_data or {}, {})
-                    st.write(f"**Q:** {question}")
-                    st.write(f"**A:** {response}")
-                    break
+                   
     
     # Footer with API setup instructions
     
