@@ -39,7 +39,7 @@ ini
 Copy
 Edit
 NEWS_API_KEY="your_key_here"
-GROQ_API_KEY="your_key_here  "       # Optional - for advanced AI analysis
+
 EXCHANGE_API_KEY="your_key_here "    # Optional - for currency conversion
 🚀 Usage
 Run the Streamlit application:
